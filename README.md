@@ -80,3 +80,46 @@ If you use this code please cite
     url={https://openreview.net/forum?id=r8snfquzs3}
 }
 ```
+
+## Alternative-conflict diagnostic
+
+The optional Sudoku diagnostic samples UNSAT **backward queries**, which include
+neural input literals, fixed inputs (if configured), and gradient-derived corrected
+outputs. It does not measure forward prediction inconsistency alone.
+
+```bash
+python -m scripts.mnist_sudoku --measure-alternative-conflicts \
+    --alternative-conflict-sample-rate 0.1
+```
+
+Minimization stays enabled. After saving the original gradient core `K`, the
+probe holds the theory and dynamic hard constraints fixed and checks `A - {k}`
+for each tracked neural assumption in `K`, stopping at the first UNSAT result.
+The original `assert_and_track` scope must first be popped: omitting a tracking
+label from `check()` would not disable its tracked constraint. Probes use explicit
+literal assumptions in a temporary scope on the existing solver.
+
+Each epoch prints cumulative `alternative_conflicts` JSON containing:
+
+- `unsat_seen`, sampled `tested`, and `with_alternative`;
+- `fraction_with_alternative`, also broken down in `by_core_size`;
+- total `probes`, `mean_probes_to_alternative` among successful searches, and
+  `tested_every_member` (including success on the final member);
+- `inconclusive` and `unknown_probes`.
+
+The fraction uses resolved sampled examples as its denominator. Empty cores
+indicate inconsistent hard constraints and are recorded as inconclusive; unknown
+probe results are inconclusive unless another probe establishes UNSAT. Core size
+is the number of tracked neural literals, not the number of Sudoku cells. The
+latest sample is available as `layer.alternative_conflicts.last`; cumulative
+metrics are available through `.summary()`. Sampling uses a private seeded RNG.
+
+There is no conflict cache, additional core enumeration, or change to gradient
+construction. Disabled diagnostics perform no probes. Enabled probes preserve
+assertions and use the original core for the current gradient, but extra checks
+can affect Z3's internal search state and subsequent model/core choices; identical
+training trajectories are not guaranteed when reusing the same solver.
+
+Sanity checks: `python -m unittest discover -s tests -v` (Z3 required; the gradient
+integration check additionally requires PyTorch). Full Sudoku training requires
+the existing dataset, dependencies, and CUDA setup.

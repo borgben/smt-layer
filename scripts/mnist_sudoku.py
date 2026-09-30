@@ -2,6 +2,7 @@ import numpy as np
 import numpy.random as npr
 
 import os
+import json
 import requests
 import itertools
 import random
@@ -85,7 +86,8 @@ class MNISTDecoder(nn.Module):
         return x
 
 class MNISTSudokuSolver(nn.Module):
-    def __init__(self, size=9):
+    def __init__(self, size=9, measure_alternative_conflicts=False,
+                 alternative_conflict_sample_rate=0.1):
         super(MNISTSudokuSolver, self).__init__()
         
         self.size = size
@@ -130,6 +132,8 @@ class MNISTSudokuSolver(nn.Module):
             theory=clauses,
             variables=variables,
             solverop='smt',
+            measure_alternative_conflicts=measure_alternative_conflicts,
+            alternative_conflict_sample_rate=alternative_conflict_sample_rate,
             default_mask=None)
 
         self.decode = MNISTDecoder(4)
@@ -291,7 +295,8 @@ def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
     
     for batch_idx, (data, mask, target) in tloader:
 
-        data, target, mask = data.cuda(), target.cuda(), mask.cuda()
+        device = next(model.parameters()).device
+        data, target, mask = data.to(device), target.to(device), mask.to(device)
 
         if random.choice(range(10)) < 5:
             alldata = [data[i].unsqueeze(0) for i in range(len(data))]
@@ -350,7 +355,8 @@ def test_epoch(epoch_idx, model, test_load, use_satlayer=True, do_maxsat=False):
     for batch_idx, (data, mask, target) in tloader:
         with torch.no_grad():
             
-            data, target, mask = data.cuda(), target.cuda(), mask.cuda()
+            device = next(model.parameters()).device
+            data, target, mask = data.to(device), target.to(device), mask.to(device)
             data = [data[:,i] for i in range(data.size(1))]
             target = target.view(target.size(0),-1)
 
@@ -386,7 +392,7 @@ def pretrain(model, optimizer, train_load, epochs, sched=None, clip_norm=None):
         
         for batch_idx, (data, _, _) in tloader:
 
-            data = data.cuda()
+            data = data.to(next(model.parameters()).device)
             data = [data[:,i] for i in range(data.size(1))]
             
             optimizer.zero_grad()
@@ -431,6 +437,10 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
 
         test_acc, test_loss = test_epoch(epoch, model, test_load, use_satlayer=use_satlayer)
         
+        if model.sat.alternative_conflicts is not None:
+            print('alternative_conflicts ' + json.dumps(dict(
+                epoch=epoch, **model.sat.alternative_conflicts.summary())))
+
         prev_acc = train_acc
         times.append(elapsed)
 
@@ -449,6 +459,8 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
 @click.option('--clip_norm', default=0.1, show_default=True, help='Gradient clipping norm.')
 @click.option('--maxsat_forward', is_flag=True, show_default=True, help='Maxsat forward pass.')
 @click.option('--maxsat_backward', is_flag=True, show_default=True, help='Maxsat backward pass.')
+@click.option('--measure-alternative-conflicts', is_flag=True, help='Probe alternative backward conflicts; report cumulative JSON each epoch.')
+@click.option('--alternative-conflict-sample-rate', default=0.1, type=click.FloatRange(0, 1), show_default=True)
 def main(
     lr=1.,
     pretrain_epochs=20,
@@ -458,15 +470,26 @@ def main(
     trials=1,
     clip_norm=0.1,
     maxsat_forward=False,
-    maxsat_backward=False
+    maxsat_backward=False,
+    measure_alternative_conflicts=False,
+    alternative_conflict_sample_rate=0.1
 ):
 
     pretrain_load, _ = get_dataloader(0.9, batch_size=256)
     train_load, test_load = get_dataloader(pct, batch_size=batch_size)
     grad_scaling = None
 
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU unavailable. Check the NVIDIA driver with nvidia-smi.")
+    device = torch.device("cuda")
+    print(f"Training device: {device}")
+
+    train_accs, test_accs, times = [], [], []
+
     for i in range(trials):
-        model = MNISTSudokuSolver(size=9).cuda()
+        model = MNISTSudokuSolver(
+            size=9, measure_alternative_conflicts=measure_alternative_conflicts,
+            alternative_conflict_sample_rate=alternative_conflict_sample_rate).to(device)
         if pretrain_epochs > 0:
             # pre_optimizer = optim.SGD([{'params': model.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
             pre_optimizer = optim.Adam([{'params': model.extractor.parameters(), 'lr': 1.e-3},

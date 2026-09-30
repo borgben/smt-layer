@@ -6,6 +6,7 @@ from torch.autograd.function import once_differentiable
 
 import warnings
 import z3
+from .diagnostics import AlternativeConflictDiagnostic
 
 class Z3SolverOp(torch.autograd.Function):
 	"""
@@ -345,14 +346,25 @@ class Z3SolverOp(torch.autograd.Function):
 				else:
 					solver.assert_and_track(xcon, input_ids[j])
 
-			# check satisfiability of the current solver state
-			if solver.check() == z3.sat:
+			# Save the original core for gradients before any diagnostic checks.
+			result = solver.check()
+			if result == z3.sat:
 				is_sat = True
 			else:
-				core = solver.unsat_core()
+				core = list(solver.unsat_core())
 				is_sat = False
 
 			solver.pop()
+
+			if result == z3.unsat and model.alternative_conflicts is not None:
+				hard = list(new_y_cons)
+				tracked = []
+				for j, xcon in enumerate(li):
+					if model._is_fixed[z3_inputs[j]]:
+						hard.append(xcon)
+					else:
+						tracked.append((input_ids[j], xcon))
+				model.alternative_conflicts.observe(solver, hard, tracked, core)
 
 			if not is_sat:
 				indices = [int(str(phi)[3:]) for phi in core if str(phi).startswith('var')]
@@ -507,11 +519,17 @@ class SMTLayer(torch.nn.Module):
 		variables: list[z3.BoolRef]=None,
 		default_mask: torch.Tensor=None,
 		fixed_inputs: list[z3.BoolRef]=None,
-		solverop: str='smt'
+		solverop: str='smt',
+		measure_alternative_conflicts: bool=False,
+		alternative_conflict_sample_rate: float=0.1
 	):
 		
 		super().__init__()
 		
+		if measure_alternative_conflicts and solverop != 'smt':
+			raise ValueError('alternative conflict diagnostics require solverop=smt')
+		self.alternative_conflicts = (AlternativeConflictDiagnostic(
+			alternative_conflict_sample_rate) if measure_alternative_conflicts else None)
 		self.input_size = input_size
 		self.output_size = output_size
 		self.theory = theory
