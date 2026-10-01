@@ -172,3 +172,49 @@ and excluded from exact-count statistics; partial proven counts remain in the
 records. Fractions use `exact_examples` as their denominator. These are bit
 conflicts relative to the corrected outputs, not necessarily different cells.
 The same solver-search-state caveat as the alternative diagnostic applies.
+
+## Training with all singleton conflicts
+
+The default `--conflict-gradient core` retains the original minimized-core
+backward update. `--conflict-gradient all_singletons` checks every non-fixed
+neural assumption independently on every UNSAT backward query. If the background
+is SAT, all checks are conclusive, and at least one singleton conflict exists,
+its full set of bit coordinates receives the existing `grad_minus` update.
+Otherwise the original minimized core is used. SAT and unchanged-target paths
+remain unchanged. The mode applies only to the SMT backward implementation.
+
+Run a paired comparison with the same settings and seed:
+
+```bash
+python -m scripts.mnist_sudoku --conflict-gradient core \
+    --seed 0 --epochs 5 --no-early-stop | tee baseline-seed0.log
+python -m scripts.mnist_sudoku --conflict-gradient all_singletons \
+    --seed 0 --epochs 5 --no-early-stop | tee singletons-seed0.log
+```
+
+Repeat with seeds 1 and 2. Seeding covers model initialization, pretraining,
+shuffling, and Python's batch-splitting choices. CUDA and solver execution can
+still be nondeterministic; identical full trajectories are not guaranteed.
+`--no-early-stop` keeps the epoch budget equal. Existing CUDA, data, and dependency
+requirements still apply; these commands run pretraining as before.
+
+There is no new gradient normalization: the default Sudoku configuration uses
+`grad_scaling=None`, so each selected bit gets its usual gradient magnitude.
+Existing optimizer gradient clipping still applies. If using the layer API with
+`grad_scaling` set, its existing softmax weights apply over the selected set.
+The new mode can increase the total gradient magnitude and takes extra solver
+time; both are part of this initial comparison.
+
+Each epoch prints `training_metrics` JSON with the mode, existing train/test
+accuracy and loss, training seconds for that epoch, and cumulative
+`singleton_gradient` counters (`queries`, `solver_calls`, `singleton_updates`,
+`core_fallbacks`). The accuracy fields retain the existing task metric; they
+are not a newly introduced exact match metric against solution labels. Compare
+accuracy after equal epochs and alongside elapsed time before drawing conclusions.
+
+Diagnostic flags remain optional and independently sampled. They never sample
+which training examples get singleton updates. When singleton diagnostics are
+enabled alongside the new gradient mode, they reuse that example's probe result
+rather than checking its assumptions twice. Their `solver_calls` reports the
+checks underlying sampled measurements, not additional diagnostic-only checks.
+No caching is introduced.

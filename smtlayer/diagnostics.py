@@ -1,4 +1,4 @@
-"""Optional probes of alternative conflicts; never selects a gradient core."""
+"""Conflict diagnostics and singleton probes shared with the optional gradient mode."""
 from collections import Counter
 import random
 from statistics import mean, median
@@ -110,6 +110,31 @@ class AlternativeConflictDiagnostic:
                                   for size, counts in sorted(self.by_core_size.items())})
 
 
+def probe_singletons(solver, hard, tracked):
+    """Return conflicting tracking labels and probe statistics; restore assertions."""
+    selected = []
+    record = dict(assumption_count=len(tracked), singleton_count=None,
+                  proven_singletons=0, unknown_probes=0, solver_calls=1)
+    solver.push()
+    try:
+        solver.add(*hard)
+        background = solver.check()
+        record['background_status'] = str(background)
+        if background == z3.sat:
+            for label, literal in tracked:
+                result = solver.check(literal)
+                record['solver_calls'] += 1
+                if result == z3.unsat:
+                    selected.append(label)
+                record['unknown_probes'] += int(result == z3.unknown)
+            record['proven_singletons'] = len(selected)
+            if not record['unknown_probes']:
+                record['singleton_count'] = len(selected)
+    finally:
+        solver.pop()
+    return selected, record
+
+
 class SingletonConflictDiagnostic:
     """Count individually inconsistent neural literals, without selecting gradients."""
 
@@ -122,29 +147,14 @@ class SingletonConflictDiagnostic:
         self.records = []
         self.last = None
 
-    def observe(self, solver, hard, tracked, core):
+    def observe(self, solver, hard, tracked, core, probe=None):
         self.unsat_seen += 1
         if self._rng.random() >= self.sample_rate:
             return
-        record = dict(unsat_query=self.unsat_seen, core_size=len(core),
-                      assumption_count=len(tracked), singleton_count=None,
-                      proven_singletons=0, unknown_probes=0, solver_calls=1)
-        solver.push()
-        try:
-            solver.add(*hard)
-            background = solver.check()
-            record['background_status'] = str(background)
-            if background == z3.sat:
-                for _, literal in tracked:
-                    # Each call supplies exactly one assumption, not a growing set.
-                    result = solver.check(literal)
-                    record['solver_calls'] += 1
-                    record['proven_singletons'] += int(result == z3.unsat)
-                    record['unknown_probes'] += int(result == z3.unknown)
-                if not record['unknown_probes']:
-                    record['singleton_count'] = record['proven_singletons']
-        finally:
-            solver.pop()
+        if probe is None:
+            probe = probe_singletons(solver, hard, tracked)
+        _, stats = probe
+        record = dict(stats, unsat_query=self.unsat_seen, core_size=len(core))
         self.last = record
         self.records.append(record)
 

@@ -88,7 +88,7 @@ class MNISTDecoder(nn.Module):
 class MNISTSudokuSolver(nn.Module):
     def __init__(self, size=9, measure_alternative_conflicts=False,
                  alternative_conflict_sample_rate=0.1, measure_singleton_conflicts=False,
-                 singleton_conflict_sample_rate=0.01):
+                 singleton_conflict_sample_rate=0.01, conflict_gradient='core'):
         super(MNISTSudokuSolver, self).__init__()
         
         self.size = size
@@ -137,6 +137,7 @@ class MNISTSudokuSolver(nn.Module):
             alternative_conflict_sample_rate=alternative_conflict_sample_rate,
             measure_singleton_conflicts=measure_singleton_conflicts,
             singleton_conflict_sample_rate=singleton_conflict_sample_rate,
+            conflict_gradient=conflict_gradient,
             default_mask=None)
 
         self.decode = MNISTDecoder(4)
@@ -420,7 +421,7 @@ def pretrain(model, optimizer, train_load, epochs, sched=None, clip_norm=None):
 
 def train(model, optimizer, train_load, test_load, epochs, pct,
           use_satlayer=True, clip_norm=None, sched=None, do_sched_batch=False,
-          grad_scaling=None, do_maxsat_forward=None):
+          grad_scaling=None, do_maxsat_forward=None, early_stop=True):
     
     times = []
     prev_acc = None
@@ -448,10 +449,16 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
             print('singleton_conflicts ' + json.dumps(dict(
                 epoch=epoch, **model.sat.singleton_conflicts.summary())))
 
+        print('training_metrics ' + json.dumps(dict(
+            epoch=epoch, conflict_gradient=model.sat.conflict_gradient,
+            train_acc=float(train_acc), test_acc=float(test_acc),
+            train_loss=float(train_loss), test_loss=float(test_loss),
+            train_seconds=elapsed, singleton_gradient=model.sat.singleton_gradient_stats)))
+
         prev_acc = train_acc
         times.append(elapsed)
 
-        if train_acc > 0.999:
+        if early_stop and train_acc > 0.999:
             break
 
     return train_acc, test_acc, sum(times)/float(epochs)
@@ -470,6 +477,9 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
 @click.option('--alternative-conflict-sample-rate', default=0.1, type=click.FloatRange(0, 1), show_default=True)
 @click.option('--measure-singleton-conflicts', is_flag=True, help='Count independently conflicting neural bits in sampled UNSAT backward queries.')
 @click.option('--singleton-conflict-sample-rate', default=0.01, type=click.FloatRange(0, 1), show_default=True)
+@click.option('--conflict-gradient', type=click.Choice(['core', 'all_singletons']), default='core', show_default=True)
+@click.option('--seed', type=click.IntRange(0, 2**32 - 1), default=None, help='Seed Python, NumPy and PyTorch for matched runs.')
+@click.option('--early-stop/--no-early-stop', default=True, show_default=True)
 def main(
     lr=1.,
     pretrain_epochs=20,
@@ -483,7 +493,10 @@ def main(
     measure_alternative_conflicts=False,
     alternative_conflict_sample_rate=0.1,
     measure_singleton_conflicts=False,
-    singleton_conflict_sample_rate=0.01
+    singleton_conflict_sample_rate=0.01,
+    conflict_gradient='core',
+    seed=None,
+    early_stop=True
 ):
 
     pretrain_load, _ = get_dataloader(0.9, batch_size=256)
@@ -498,11 +511,19 @@ def main(
     train_accs, test_accs, times = [], [], []
 
     for i in range(trials):
+        if seed is not None:
+            trial_seed = (seed + i) % (2**32)
+            random.seed(trial_seed)
+            np.random.seed(trial_seed)
+            torch.manual_seed(trial_seed)
+            torch.cuda.manual_seed_all(trial_seed)
+        print(f'Trial {i + 1}: conflict_gradient={conflict_gradient}, seed={None if seed is None else trial_seed}')
         model = MNISTSudokuSolver(
             size=9, measure_alternative_conflicts=measure_alternative_conflicts,
             alternative_conflict_sample_rate=alternative_conflict_sample_rate,
             measure_singleton_conflicts=measure_singleton_conflicts,
-            singleton_conflict_sample_rate=singleton_conflict_sample_rate).to(device)
+            singleton_conflict_sample_rate=singleton_conflict_sample_rate,
+            conflict_gradient=conflict_gradient).to(device)
         if pretrain_epochs > 0:
             # pre_optimizer = optim.SGD([{'params': model.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
             pre_optimizer = optim.Adam([{'params': model.extractor.parameters(), 'lr': 1.e-3},
@@ -526,7 +547,7 @@ def main(
         
         train_acc, test_acc, elapsed = train(model, optimizer, train_load, test_load, epochs, pct,
                                                 clip_norm=clip_norm, sched=sched, do_sched_batch=True, grad_scaling=grad_scaling, 
-                                                do_maxsat_forward=maxsat_forward)
+                                                do_maxsat_forward=maxsat_forward, early_stop=early_stop)
 
         train_accs.append(train_acc)
         test_accs.append(test_acc)
