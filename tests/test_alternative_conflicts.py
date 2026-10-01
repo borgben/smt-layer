@@ -14,7 +14,7 @@ Diagnostic = module.AlternativeConflictDiagnostic
 
 
 class DiagnosticTests(unittest.TestCase):
-    def run_case(self, theory, assumptions, hard=(), rate=1):
+    def run_case(self, theory, assumptions, hard=(), rate=1, diagnostic_type=Diagnostic):
         solver = z3.Solver()
         solver.set('core.minimize', True)
         solver.add(*theory)
@@ -28,7 +28,7 @@ class DiagnosticTests(unittest.TestCase):
         core = list(solver.unsat_core())
         solver.pop()
         state = random.getstate()
-        diagnostic = Diagnostic(rate)
+        diagnostic = diagnostic_type(rate)
         diagnostic.observe(solver, hard, tracked, core)
         self.assertEqual(random.getstate(), state)
         self.assertEqual(solver.sexpr(), background)
@@ -42,6 +42,9 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(d.last['probes'], 2)
         self.assertEqual(d.summary()['tested_every_member'], 1)
         self.assertEqual(d.summary()['fraction_with_alternative'], 0)
+        self.assertIsNone(d.last['core_pair'])
+        self.assertEqual(d.summary()['core_pairs']['pair_count'], 0)
+        self.assertIsNone(d.summary()['core_pairs']['mean_novelty'])
 
     def test_disjoint_conflicts(self):
         a, b, c, d = z3.Bools('a b c d')
@@ -50,11 +53,41 @@ class DiagnosticTests(unittest.TestCase):
         self.assertTrue(diagnostic.last['alternative'])
         self.assertEqual(diagnostic.last['probes'], 1)
         self.assertEqual(diagnostic.summary()['fraction_with_alternative'], 1)
+        self.assertEqual(diagnostic.last['core_pair'], dict(
+            k1_size=2, k2_size=2, intersection_size=0, new_coordinates=2,
+            jaccard_overlap=0., novelty=1., disjoint=True))
+        self.assertEqual(diagnostic.summary()['core_pairs']['fraction_disjoint'], 1)
 
     def test_overlapping_conflicts(self):
         a, b, c = z3.Bools('a b c')
         d = self.run_case([z3.Not(z3.And(a, b)), z3.Not(z3.And(a, c))], [a, b, c])
         self.assertTrue(d.last['alternative'])
+        self.assertEqual(d.last['core_pair'], dict(
+            k1_size=2, k2_size=2, intersection_size=1, new_coordinates=1,
+            jaccard_overlap=1 / 3, novelty=0.5, disjoint=False))
+
+    def test_negative_literals_and_singletons(self):
+        a, b = z3.Bools('a b')
+        d = self.run_case([a, b], [z3.Not(a), z3.Not(b)])
+        self.assertEqual(d.last['core_pair'], dict(
+            k1_size=1, k2_size=1, intersection_size=0, new_coordinates=1,
+            jaccard_overlap=0., novelty=1., disjoint=True))
+        self.assertEqual(d.last['probes'], 1)
+
+    def test_pair_aggregates(self):
+        a, b, c, e = z3.Bools('a b c e')
+        disjoint = self.run_case([z3.Not(z3.And(a, b)), z3.Not(z3.And(c, e))],
+                                 [a, b, c, e])
+        overlap = self.run_case([z3.Not(z3.And(a, b)), z3.Not(z3.And(a, c))],
+                                [a, b, c])
+        disjoint.core_pairs.extend(overlap.core_pairs)
+        stats = disjoint.summary()['core_pairs']
+        self.assertEqual(stats['pair_count'], 2)
+        self.assertEqual(stats['mean_novelty'], 0.75)
+        self.assertEqual(stats['median_novelty'], 0.75)
+        self.assertAlmostEqual(stats['mean_jaccard_overlap'], 1 / 6)
+        self.assertAlmostEqual(stats['median_jaccard_overlap'], 1 / 6)
+        self.assertEqual(stats['fraction_disjoint'], 0.5)
 
     def test_hard_context_and_negative_literal(self):
         a, b = z3.Bools('a b')
@@ -67,6 +100,7 @@ class DiagnosticTests(unittest.TestCase):
         d = self.run_case([z3.Not(a)], [a], rate=0)
         self.assertEqual(d.unsat_seen, 1)
         self.assertIsNone(d.last)
+        self.assertEqual(d.core_pairs, [])
         self.assertIsNone(d.summary()['fraction_with_alternative'])
 
     def test_empty_core(self):
@@ -104,12 +138,14 @@ class GradientIntegrationTests(unittest.TestCase):
         results = []
         # With output=false, either positive input is a conflict. The probe
         # necessarily finds an alternative but must not replace the saved core.
-        for enabled in (False, True):
+        for enabled, singleton_enabled in ((False, False), (True, False), (False, True), (True, True)):
             layer = SMTLayer(2, 1, [output == z3.Or(a, b)],
                              variables=[a, b, output],
                              default_mask=torch.tensor([1., 1., 0.]),
                              measure_alternative_conflicts=enabled,
-                             alternative_conflict_sample_rate=1.)
+                             alternative_conflict_sample_rate=1.,
+                             measure_singleton_conflicts=singleton_enabled,
+                             singleton_conflict_sample_rate=1.)
             x = torch.tensor([[0.7, 0.9, 0.]], requires_grad=True)
             y = layer(x)
             y.sum().backward()
@@ -117,8 +153,13 @@ class GradientIntegrationTests(unittest.TestCase):
             self.assertEqual(layer._solver.num_scopes(), 0)
             if enabled:
                 self.assertEqual(layer.alternative_conflicts.summary()['with_alternative'], 1)
-        self.assertTrue(torch.equal(results[0][0], results[1][0]))
-        self.assertTrue(torch.equal(results[0][1], results[1][1]))
+                self.assertEqual(layer.alternative_conflicts.summary()['core_pairs']['pair_count'], 1)
+            if singleton_enabled:
+                self.assertEqual(layer.singleton_conflicts.last['singleton_count'], 2)
+                self.assertEqual(layer.singleton_conflicts.last['core_size'], 1)
+        for output_value, gradient in results[1:]:
+            self.assertTrue(torch.equal(results[0][0], output_value))
+            self.assertTrue(torch.equal(results[0][1], gradient))
 
 
 if __name__ == '__main__':

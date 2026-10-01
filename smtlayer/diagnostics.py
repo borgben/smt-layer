@@ -1,6 +1,7 @@
 """Optional probes of alternative conflicts; never selects a gradient core."""
 from collections import Counter
 import random
+from statistics import mean, median
 
 import z3
 
@@ -15,6 +16,8 @@ class AlternativeConflictDiagnostic:
         self.unsat_seen = 0
         self.by_core_size = {}
         self.last = None
+        # Scalar measurements only; no cores are cached or reused.
+        self.core_pairs = []
 
     def observe(self, solver, hard, tracked, core):
         """Called after popping the original example scope.
@@ -29,8 +32,10 @@ class AlternativeConflictDiagnostic:
         labels = {label.get_id(): i for i, (label, _) in enumerate(tracked)}
         core_indices = [labels[label.get_id()] for label in core]
         assumptions = [literal for _, literal in tracked]
+        literal_indices = {literal.get_id(): i for i, literal in enumerate(assumptions)}
         probes = unknowns = 0
         alternative = False
+        pair = None
         solver.push()
         try:
             solver.add(*hard)
@@ -39,6 +44,19 @@ class AlternativeConflictDiagnostic:
                 probes += 1
                 if result == z3.unsat:
                     alternative = True
+                    # K1 uses tracking labels; this assumption-based check
+                    # returns literals. Compare positions in the same A.
+                    k1 = set(core_indices)
+                    k2 = {literal_indices[literal.get_id()]
+                          for literal in solver.unsat_core()}
+                    shared = len(k1 & k2)
+                    novel = len(k2 - k1)
+                    pair = dict(k1_size=len(k1), k2_size=len(k2),
+                                intersection_size=shared, new_coordinates=novel,
+                                jaccard_overlap=shared / len(k1 | k2),
+                                novelty=novel / len(k2) if k2 else None,
+                                disjoint=not bool(shared))
+                    self.core_pairs.append(pair)
                     break
                 if result == z3.unknown:
                     unknowns += 1
@@ -49,7 +67,8 @@ class AlternativeConflictDiagnostic:
         # single-removal test cannot identify another neural conflict.
         inconclusive = not alternative and (unknowns > 0 or size == 0)
         self.last = dict(core_size=size, probes=probes,
-                         alternative=alternative, inconclusive=inconclusive)
+                         alternative=alternative, inconclusive=inconclusive,
+                         core_pair=pair)
         counts = self.by_core_size.setdefault(size, Counter())
         counts.update(tested=1, with_alternative=int(alternative),
                       inconclusive=int(inconclusive), probes=probes,
@@ -72,6 +91,91 @@ class AlternativeConflictDiagnostic:
         total = Counter()
         for counts in self.by_core_size.values():
             total.update(counts)
+        # Empty K2 means inconsistent hard constraints, not a second set of
+        # neural coordinates. Retain its record but exclude it from averages.
+        pairs = [pair for pair in self.core_pairs if pair['k2_size'] > 0]
+        pair_stats = dict(pair_count=len(self.core_pairs),
+                          nonempty_pair_count=len(pairs),
+                          empty_alternative_cores=len(self.core_pairs) - len(pairs),
+                          fraction_disjoint=(mean(p['disjoint'] for p in pairs)
+                                             if pairs else None))
+        for name in ('k1_size', 'k2_size', 'intersection_size', 'new_coordinates',
+                     'jaccard_overlap', 'novelty'):
+            values = [pair[name] for pair in pairs]
+            pair_stats['mean_' + name] = mean(values) if values else None
+            pair_stats['median_' + name] = median(values) if values else None
         return dict(unsat_seen=self.unsat_seen, **report(total),
+                    core_pairs=pair_stats,
                     by_core_size={size: report(counts)
                                   for size, counts in sorted(self.by_core_size.items())})
+
+
+class SingletonConflictDiagnostic:
+    """Count individually inconsistent neural literals, without selecting gradients."""
+
+    def __init__(self, sample_rate=0.01, seed=0):
+        if not 0 <= sample_rate <= 1:
+            raise ValueError('singleton conflict sample rate must be in [0, 1]')
+        self.sample_rate = sample_rate
+        self._rng = random.Random(seed)
+        self.unsat_seen = 0
+        self.records = []
+        self.last = None
+
+    def observe(self, solver, hard, tracked, core):
+        self.unsat_seen += 1
+        if self._rng.random() >= self.sample_rate:
+            return
+        record = dict(unsat_query=self.unsat_seen, core_size=len(core),
+                      assumption_count=len(tracked), singleton_count=None,
+                      proven_singletons=0, unknown_probes=0, solver_calls=1)
+        solver.push()
+        try:
+            solver.add(*hard)
+            background = solver.check()
+            record['background_status'] = str(background)
+            if background == z3.sat:
+                for _, literal in tracked:
+                    # Each call supplies exactly one assumption, not a growing set.
+                    result = solver.check(literal)
+                    record['solver_calls'] += 1
+                    record['proven_singletons'] += int(result == z3.unsat)
+                    record['unknown_probes'] += int(result == z3.unknown)
+                if not record['unknown_probes']:
+                    record['singleton_count'] = record['proven_singletons']
+        finally:
+            solver.pop()
+        self.last = record
+        self.records.append(record)
+
+    def summary(self):
+        exact = [r for r in self.records if r['singleton_count'] is not None]
+
+        def distribution(records):
+            counts = [r['singleton_count'] for r in records]
+            bins = dict.fromkeys(('0', '1', '2-4', '5-9', '10+'), 0)
+            for count in counts:
+                bucket = ('0' if count == 0 else '1' if count == 1 else
+                          '2-4' if count <= 4 else '5-9' if count <= 9 else '10+')
+                bins[bucket] += 1
+            return dict(exact_examples=len(counts),
+                        mean_singleton_count=mean(counts) if counts else None,
+                        median_singleton_count=median(counts) if counts else None,
+                        histogram=dict(sorted(Counter(counts).items())),
+                        fractions={k: v / len(counts) if counts else None
+                                   for k, v in bins.items()},
+                        mean_core_size=mean(r['core_size'] for r in records) if records else None,
+                        median_core_size=median(r['core_size'] for r in records) if records else None,
+                        fraction_count_exceeds_core_size=(
+                            mean(r['singleton_count'] > r['core_size'] for r in records)
+                            if records else None))
+
+        return dict(unsat_seen=self.unsat_seen, tested=len(self.records),
+                    inconclusive=len(self.records) - len(exact),
+                    background_unsat=sum(r['background_status'] == 'unsat' for r in self.records),
+                    background_unknown=sum(r['background_status'] == 'unknown' for r in self.records),
+                    unknown_probes=sum(r['unknown_probes'] for r in self.records),
+                    solver_calls=sum(r['solver_calls'] for r in self.records),
+                    **distribution(exact),
+                    by_core_size={size: distribution([r for r in exact if r['core_size'] == size])
+                                  for size in sorted({r['core_size'] for r in exact})})

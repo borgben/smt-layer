@@ -87,7 +87,8 @@ class MNISTDecoder(nn.Module):
 
 class MNISTSudokuSolver(nn.Module):
     def __init__(self, size=9, measure_alternative_conflicts=False,
-                 alternative_conflict_sample_rate=0.1):
+                 alternative_conflict_sample_rate=0.1, measure_singleton_conflicts=False,
+                 singleton_conflict_sample_rate=0.01):
         super(MNISTSudokuSolver, self).__init__()
         
         self.size = size
@@ -134,6 +135,8 @@ class MNISTSudokuSolver(nn.Module):
             solverop='smt',
             measure_alternative_conflicts=measure_alternative_conflicts,
             alternative_conflict_sample_rate=alternative_conflict_sample_rate,
+            measure_singleton_conflicts=measure_singleton_conflicts,
+            singleton_conflict_sample_rate=singleton_conflict_sample_rate,
             default_mask=None)
 
         self.decode = MNISTDecoder(4)
@@ -441,6 +444,10 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
             print('alternative_conflicts ' + json.dumps(dict(
                 epoch=epoch, **model.sat.alternative_conflicts.summary())))
 
+        if model.sat.singleton_conflicts is not None:
+            print('singleton_conflicts ' + json.dumps(dict(
+                epoch=epoch, **model.sat.singleton_conflicts.summary())))
+
         prev_acc = train_acc
         times.append(elapsed)
 
@@ -461,6 +468,8 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
 @click.option('--maxsat_backward', is_flag=True, show_default=True, help='Maxsat backward pass.')
 @click.option('--measure-alternative-conflicts', is_flag=True, help='Probe alternative backward conflicts; report cumulative JSON each epoch.')
 @click.option('--alternative-conflict-sample-rate', default=0.1, type=click.FloatRange(0, 1), show_default=True)
+@click.option('--measure-singleton-conflicts', is_flag=True, help='Count independently conflicting neural bits in sampled UNSAT backward queries.')
+@click.option('--singleton-conflict-sample-rate', default=0.01, type=click.FloatRange(0, 1), show_default=True)
 def main(
     lr=1.,
     pretrain_epochs=20,
@@ -472,7 +481,9 @@ def main(
     maxsat_forward=False,
     maxsat_backward=False,
     measure_alternative_conflicts=False,
-    alternative_conflict_sample_rate=0.1
+    alternative_conflict_sample_rate=0.1,
+    measure_singleton_conflicts=False,
+    singleton_conflict_sample_rate=0.01
 ):
 
     pretrain_load, _ = get_dataloader(0.9, batch_size=256)
@@ -489,7 +500,9 @@ def main(
     for i in range(trials):
         model = MNISTSudokuSolver(
             size=9, measure_alternative_conflicts=measure_alternative_conflicts,
-            alternative_conflict_sample_rate=alternative_conflict_sample_rate).to(device)
+            alternative_conflict_sample_rate=alternative_conflict_sample_rate,
+            measure_singleton_conflicts=measure_singleton_conflicts,
+            singleton_conflict_sample_rate=singleton_conflict_sample_rate).to(device)
         if pretrain_epochs > 0:
             # pre_optimizer = optim.SGD([{'params': model.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
             pre_optimizer = optim.Adam([{'params': model.extractor.parameters(), 'lr': 1.e-3},

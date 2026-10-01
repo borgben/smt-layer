@@ -6,7 +6,7 @@ from torch.autograd.function import once_differentiable
 
 import warnings
 import z3
-from .diagnostics import AlternativeConflictDiagnostic
+from .diagnostics import AlternativeConflictDiagnostic, SingletonConflictDiagnostic
 
 class Z3SolverOp(torch.autograd.Function):
 	"""
@@ -356,7 +356,8 @@ class Z3SolverOp(torch.autograd.Function):
 
 			solver.pop()
 
-			if result == z3.unsat and model.alternative_conflicts is not None:
+			if result == z3.unsat and (model.alternative_conflicts is not None
+									or model.singleton_conflicts is not None):
 				hard = list(new_y_cons)
 				tracked = []
 				for j, xcon in enumerate(li):
@@ -364,7 +365,10 @@ class Z3SolverOp(torch.autograd.Function):
 						hard.append(xcon)
 					else:
 						tracked.append((input_ids[j], xcon))
-				model.alternative_conflicts.observe(solver, hard, tracked, core)
+				if model.alternative_conflicts is not None:
+					model.alternative_conflicts.observe(solver, hard, tracked, core)
+				if model.singleton_conflicts is not None:
+					model.singleton_conflicts.observe(solver, hard, tracked, core)
 
 			if not is_sat:
 				indices = [int(str(phi)[3:]) for phi in core if str(phi).startswith('var')]
@@ -521,15 +525,19 @@ class SMTLayer(torch.nn.Module):
 		fixed_inputs: list[z3.BoolRef]=None,
 		solverop: str='smt',
 		measure_alternative_conflicts: bool=False,
-		alternative_conflict_sample_rate: float=0.1
+		alternative_conflict_sample_rate: float=0.1,
+		measure_singleton_conflicts: bool=False,
+		singleton_conflict_sample_rate: float=0.01
 	):
 		
 		super().__init__()
 		
-		if measure_alternative_conflicts and solverop != 'smt':
-			raise ValueError('alternative conflict diagnostics require solverop=smt')
+		if (measure_alternative_conflicts or measure_singleton_conflicts) and solverop != 'smt':
+			raise ValueError('conflict diagnostics require solverop=smt')
 		self.alternative_conflicts = (AlternativeConflictDiagnostic(
 			alternative_conflict_sample_rate) if measure_alternative_conflicts else None)
+		self.singleton_conflicts = (SingletonConflictDiagnostic(
+			singleton_conflict_sample_rate) if measure_singleton_conflicts else None)
 		self.input_size = input_size
 		self.output_size = output_size
 		self.theory = theory

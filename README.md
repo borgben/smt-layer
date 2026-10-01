@@ -99,6 +99,22 @@ The original `assert_and_track` scope must first be popped: omitting a tracking
 label from `check()` would not disable its tracked constraint. Probes use explicit
 literal assumptions in a temporary scope on the existing solver.
 
+At the first UNSAT probe, the diagnostic retrieves one alternative minimized
+core `K2` using the existing solver configuration, with no additional checks.
+It compares neural bit coordinates against the original core `K1`. Each pair
+records `k1_size`, `k2_size`, `intersection_size`, `new_coordinates` (`|K2 - K1|`),
+`jaccard_overlap` (intersection size divided by union size),
+`novelty` (`|K2 - K1| / |K2|`), and `disjoint`.
+
+The epoch JSON's `core_pairs` object reports pair counts, mean and median of
+these sizes and ratios, and `fraction_disjoint`. Per-pair scalar records are
+available in `layer.alternative_conflicts.core_pairs`, with the latest pair in
+`.last['core_pair']`. Empty alternative cores are counted separately and excluded
+from pair averages because they identify an inconsistent hard context rather
+than neural coordinates. No-pair averages are `null`. These statistics describe
+the first alternative found in solver core order, not a uniform sample of all
+conflicts. Records accumulate for the training run; no cores are cached.
+
 Each epoch prints cumulative `alternative_conflicts` JSON containing:
 
 - `unsat_seen`, sampled `tested`, and `with_alternative`;
@@ -114,7 +130,7 @@ is the number of tracked neural literals, not the number of Sudoku cells. The
 latest sample is available as `layer.alternative_conflicts.last`; cumulative
 metrics are available through `.summary()`. Sampling uses a private seeded RNG.
 
-There is no conflict cache, additional core enumeration, or change to gradient
+There is no conflict cache, enumeration beyond the first alternative, or change to gradient
 construction. Disabled diagnostics perform no probes. Enabled probes preserve
 assertions and use the original core for the current gradient, but extra checks
 can affect Z3's internal search state and subsequent model/core choices; identical
@@ -123,3 +139,36 @@ training trajectories are not guaranteed when reusing the same solver.
 Sanity checks: `python -m unittest discover -s tests -v` (Z3 required; the gradient
 integration check additionally requires PyTorch). Full Sudoku training requires
 the existing dataset, dependencies, and CUDA setup.
+
+## Singleton-conflict diagnostic
+
+```bash
+python -m scripts.mnist_sudoku --measure-singleton-conflicts \
+    --singleton-conflict-sample-rate 0.01
+```
+
+This independently sampled diagnostic can run alone or alongside the alternative
+core diagnostic. For each sampled UNSAT backward query, it reuses the solver in a
+temporary scope with the same corrected outputs and any explicitly fixed inputs.
+It first checks that this hard background is SAT, then calls `solver.check(a_i)`
+for every non-fixed neural input literal independently. No other neural
+assumptions are active in that call. Each UNSAT result counts one singleton
+conflict. It costs `1 + number_of_assumptions` extra checks per sampled example
+with a SAT background. The original core and gradient calculation are unchanged.
+
+Each epoch prints cumulative `singleton_conflicts` JSON with `tested`, exact-count
+mean/median, `histogram`, and `fractions` for `0`, `1`, `2-4`, `5-9`, and `10+`.
+`by_core_size` reports the same distribution grouped by original minimized-core
+size. `fraction_count_exceeds_core_size` directly compares the singleton count
+with the original blame-set size. A sample with core size 1 and singleton count
+10 has nine additional individually conflicting bits outside that core.
+
+Per-example scalar records are available at `layer.singleton_conflicts.records`
+and the latest sampled record at `.last`, including `core_size`,
+`singleton_count`, `assumption_count`, and the run-local `unsat_query` counter
+(not a dataset ID). `.summary()` returns the epoch report. Inconsistent or
+unknown hard backgrounds and unknown individual probes are counted separately
+and excluded from exact-count statistics; partial proven counts remain in the
+records. Fractions use `exact_examples` as their denominator. These are bit
+conflicts relative to the corrected outputs, not necessarily different cells.
+The same solver-search-state caveat as the alternative diagnostic applies.
