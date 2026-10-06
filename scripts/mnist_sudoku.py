@@ -88,7 +88,8 @@ class MNISTDecoder(nn.Module):
 class MNISTSudokuSolver(nn.Module):
     def __init__(self, size=9, measure_alternative_conflicts=False,
                  alternative_conflict_sample_rate=0.1, measure_singleton_conflicts=False,
-                 singleton_conflict_sample_rate=0.01, conflict_gradient='core'):
+                 singleton_conflict_sample_rate=0.01, conflict_gradient='core',
+                 measure_singleton_cache_hits=False):
         super(MNISTSudokuSolver, self).__init__()
         
         self.size = size
@@ -138,6 +139,7 @@ class MNISTSudokuSolver(nn.Module):
             measure_singleton_conflicts=measure_singleton_conflicts,
             singleton_conflict_sample_rate=singleton_conflict_sample_rate,
             conflict_gradient=conflict_gradient,
+            measure_singleton_cache_hits=measure_singleton_cache_hits,
             default_mask=None)
 
         self.decode = MNISTDecoder(4)
@@ -268,7 +270,7 @@ def load(file):
     with open(f'data/{file}', 'rb') as f:
         return torch.load(f)
 
-def get_dataloader(train_pct, batch_size=1):
+def get_dataloader(train_pct, batch_size=1, include_instance_ids=False):
 
     X_in = load('sudoku_features.pt')
     Ximg_in = load('sudoku_features_img.pt')
@@ -279,7 +281,10 @@ def get_dataloader(train_pct, batch_size=1):
 
     nTrain = int(Ximg.size(0)*train_pct)
 
-    sud_train = TensorDataset(Ximg[:nTrain], is_input[:nTrain], Y[:nTrain])
+    train_tensors = (Ximg[:nTrain], is_input[:nTrain], Y[:nTrain])
+    if include_instance_ids:
+        train_tensors += (torch.arange(nTrain),)
+    sud_train = TensorDataset(*train_tensors)
     sud_test = TensorDataset(Ximg[max(9000,nTrain):], is_input[max(9000,nTrain):], Y[max(9000,nTrain):])
     train_load = torch.utils.data.DataLoader(sud_train, batch_size=batch_size, shuffle=True)
     test_load = torch.utils.data.DataLoader(sud_test, batch_size=batch_size)
@@ -297,7 +302,10 @@ def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
     
     model.train()
     
-    for batch_idx, (data, mask, target) in tloader:
+    for batch_idx, batch in tloader:
+
+        data, mask, target = batch[:3]
+        instance_ids = batch[3].tolist() if len(batch) == 4 else None
 
         device = next(model.parameters()).device
         data, target, mask = data.to(device), target.to(device), mask.to(device)
@@ -306,8 +314,10 @@ def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
             alldata = [data[i].unsqueeze(0) for i in range(len(data))]
             alltarget = [target[i].unsqueeze(0) for i in range(len(target))]
             allmask = [mask[i].unsqueeze(0) for i in range(len(mask))]
+            allids = [[idx] for idx in instance_ids] if instance_ids is not None else [None] * len(alldata)
         else:
             alldata, alltarget, allmask = [data], [target], [mask]
+            allids = [instance_ids]
 
         for i in range(len(alldata)):
 
@@ -317,6 +327,7 @@ def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
             target = target.view(target.size(0),-1)
             
             optimizer.zero_grad()
+            model.sat.diagnostic_instance_ids = allids[i]
             output = model(data, torch.relu(mask), return_sat=use_satlayer, 
                             grad_scaling=grad_scaling, do_maxsat=do_maxsat_forward)
 
@@ -325,6 +336,7 @@ def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
             mask_inter = mask.repeat_interleave(4,-1).view(mask.size(0),-1)
             loss = (F.binary_cross_entropy_with_logits(output, target, reduction='none') * torch.relu(-mask_inter)).mean()
             loss.backward()
+            model.sat.diagnostic_instance_ids = None
             if clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
             optimizer.step()
@@ -449,6 +461,10 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
             print('singleton_conflicts ' + json.dumps(dict(
                 epoch=epoch, **model.sat.singleton_conflicts.summary())))
 
+        if model.sat.singleton_cache is not None:
+            print('singleton_cache_hits ' + json.dumps(dict(
+                epoch=epoch, **model.sat.singleton_cache.summary())))
+
         print('training_metrics ' + json.dumps(dict(
             epoch=epoch, conflict_gradient=model.sat.conflict_gradient,
             train_acc=float(train_acc), test_acc=float(test_acc),
@@ -478,6 +494,7 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
 @click.option('--measure-singleton-conflicts', is_flag=True, help='Count independently conflicting neural bits in sampled UNSAT backward queries.')
 @click.option('--singleton-conflict-sample-rate', default=0.01, type=click.FloatRange(0, 1), show_default=True)
 @click.option('--conflict-gradient', type=click.Choice(['core', 'all_singletons']), default='core', show_default=True)
+@click.option('--measure-singleton-cache-hits', is_flag=True, help='Measure per-instance singleton recurrence across training iterations; report cumulative JSON each epoch.')
 @click.option('--seed', type=click.IntRange(0, 2**32 - 1), default=None, help='Seed Python, NumPy and PyTorch for matched runs.')
 @click.option('--early-stop/--no-early-stop', default=True, show_default=True)
 def main(
@@ -495,12 +512,14 @@ def main(
     measure_singleton_conflicts=False,
     singleton_conflict_sample_rate=0.01,
     conflict_gradient='core',
+    measure_singleton_cache_hits=False,
     seed=None,
     early_stop=True
 ):
 
     pretrain_load, _ = get_dataloader(0.9, batch_size=256)
-    train_load, test_load = get_dataloader(pct, batch_size=batch_size)
+    train_load, test_load = get_dataloader(pct, batch_size=batch_size,
+                                           include_instance_ids=measure_singleton_cache_hits)
     grad_scaling = None
 
     if not torch.cuda.is_available():
@@ -523,7 +542,8 @@ def main(
             alternative_conflict_sample_rate=alternative_conflict_sample_rate,
             measure_singleton_conflicts=measure_singleton_conflicts,
             singleton_conflict_sample_rate=singleton_conflict_sample_rate,
-            conflict_gradient=conflict_gradient).to(device)
+            conflict_gradient=conflict_gradient,
+            measure_singleton_cache_hits=measure_singleton_cache_hits).to(device)
         if pretrain_epochs > 0:
             # pre_optimizer = optim.SGD([{'params': model.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
             pre_optimizer = optim.Adam([{'params': model.extractor.parameters(), 'lr': 1.e-3},

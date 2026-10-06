@@ -189,3 +189,50 @@ class SingletonConflictDiagnostic:
                     **distribution(exact),
                     by_core_size={size: distribution([r for r in exact if r['core_size'] == size])
                                   for size in sorted({r['core_size'] for r in exact})})
+
+
+class SingletonCacheDiagnostic:
+    """Measure recurrence only; never reuse solver results or change gradients."""
+
+    def __init__(self):
+        self.seen = {}
+        self.context_seen = {}
+        self.sets = {}
+        self.counts = Counter()
+
+    def observe(self, instance_id, hard, tracked, probe):
+        selected, stats = probe
+        self.counts['queries'] += 1
+        if stats['singleton_count'] is None:
+            self.counts['inconclusive_queries'] += 1
+            return
+        self.counts['exact_queries'] += 1
+        labels = {label.get_id() for label in selected}
+        cores = frozenset((str(label), literal.sexpr())
+                          for label, literal in tracked if label.get_id() in labels)
+        seen = self.seen.setdefault(instance_id, set())
+        context = tuple(sorted(c.sexpr() for c in hard))
+        context_seen = self.context_seen.setdefault((instance_id, context), set())
+        self.counts['singleton_occurrences'] += len(cores)
+        self.counts['singleton_hits'] += len(cores & seen)
+        self.counts['same_context_hits'] += len(cores & context_seen)
+        if cores:
+            self.counts['nonempty_queries'] += 1
+            self.counts['queries_with_hits'] += int(bool(cores & seen))
+            sets = self.sets.setdefault(instance_id, set())
+            self.counts['whole_set_hits'] += int(cores in sets)
+            sets.add(cores)
+        seen.update(cores)
+        context_seen.update(cores)
+
+    def summary(self):
+        names = ('queries', 'inconclusive_queries', 'exact_queries',
+                 'singleton_occurrences', 'singleton_hits', 'same_context_hits',
+                 'nonempty_queries', 'queries_with_hits', 'whole_set_hits')
+        result = {name: self.counts[name] for name in names}
+        n = result['singleton_occurrences']
+        result.update(instances=len(self.seen),
+                      unique_singletons=sum(len(s) for s in self.seen.values()),
+                      singleton_hit_rate=result['singleton_hits'] / n if n else None,
+                      same_context_hit_rate=result['same_context_hits'] / n if n else None)
+        return result
