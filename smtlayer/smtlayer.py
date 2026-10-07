@@ -340,9 +340,14 @@ class Z3SolverOp(torch.autograd.Function):
 
 			solver.add(new_y_cons)
 
+			# After its warmup the targeted search replaces the core, so only
+			# satisfiability is checked here. The diagnostics still need the core.
+			skip_core = (model.conflict_gradient == 'targeted' and model.conflict_search.active
+					and model.alternative_conflicts is None and model.singleton_conflicts is None)
+
 			li = Z3SolverOp._floatvec_to_cons(x[i][mask[i]==1], z3_inputs)
 			for j, xcon in enumerate(li):
-				if model._is_fixed[z3_inputs[j]]:
+				if model._is_fixed[z3_inputs[j]] or skip_core:
 					solver.add(xcon)
 				else:
 					solver.assert_and_track(xcon, input_ids[j])
@@ -352,15 +357,15 @@ class Z3SolverOp(torch.autograd.Function):
 			if result == z3.sat:
 				is_sat = True
 			else:
-				core = list(solver.unsat_core())
+				core = None if skip_core else list(solver.unsat_core())
 				is_sat = False
 
 			solver.pop()
 
-			gradient_core = core if not is_sat else None
+			gradient_core = (core or []) if not is_sat else None
 			if result == z3.unsat and (model.alternative_conflicts is not None
 					or model.singleton_conflicts is not None
-					or model.conflict_gradient == "all_singletons"
+					or model.conflict_gradient in ("all_singletons", "targeted")
 					or (model.singleton_cache is not None and ctx.instance_ids is not None)):
 				hard = list(new_y_cons)
 				tracked = []
@@ -380,6 +385,11 @@ class Z3SolverOp(torch.autograd.Function):
 						model.singleton_gradient_stats['singleton_updates'] += 1
 					else:
 						model.singleton_gradient_stats['core_fallbacks'] += 1
+				if model.conflict_gradient == 'targeted':
+					weights = [abs(x[i, int(str(label)[3:])].item()) for label, _ in tracked]
+					selected = model.conflict_search.select(solver, hard, tracked, core, weights)
+					if selected or core is None:
+						gradient_core = selected
 				if model.singleton_cache is not None and ctx.instance_ids is not None:
 					if probe is None:
 						probe = probe_singletons(solver, hard, tracked)
@@ -548,16 +558,20 @@ class SMTLayer(torch.nn.Module):
 		measure_singleton_conflicts: bool=False,
 		singleton_conflict_sample_rate: float=0.01,
 		conflict_gradient: str='core',
-		measure_singleton_cache_hits: bool=False
+		measure_singleton_cache_hits: bool=False,
+		conflict_search=None
 	):
-		
+
 		super().__init__()
-		
-		if conflict_gradient not in ('core', 'all_singletons'):
-			raise ValueError('conflict_gradient must be core or all_singletons')
+
+		if conflict_gradient not in ('core', 'all_singletons', 'targeted'):
+			raise ValueError('conflict_gradient must be core, all_singletons or targeted')
 		if conflict_gradient != 'core' and solverop != 'smt':
 			raise ValueError('singleton gradients require solverop=smt')
+		if conflict_gradient == 'targeted' and conflict_search is None:
+			raise ValueError('targeted gradients require a conflict_search')
 		self.conflict_gradient = conflict_gradient
+		self.conflict_search = conflict_search
 		self.diagnostic_instance_ids = None
 		self.singleton_cache = SingletonCacheDiagnostic() if measure_singleton_cache_hits else None
 		self.singleton_gradient_stats = dict(queries=0, solver_calls=0, singleton_updates=0, core_fallbacks=0)

@@ -1,6 +1,7 @@
 import numpy as np
 import numpy.random as npr
 
+import json
 import itertools
 import random
 import z3
@@ -14,7 +15,11 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset
 
-from smtlayer import SMTLayer
+from smtlayer import SMTLayer, ConflictSearch
+
+def addition_template(indices):
+    """Bit positions used in each digit, with the two digits interchangeable."""
+    return tuple(sorted(tuple(i % 4 for i in indices if i // 4 == digit) for digit in range(2)))
 
 class MNISTAddition(torch.utils.data.Dataset):
     def __init__(self, x_by_classes, label_pairs):
@@ -74,7 +79,7 @@ class MNISTExtractor(nn.Module):
         return out
 
 class MNISTAdder(nn.Module):
-    def __init__(self, use_maxsmt=False):
+    def __init__(self, use_maxsmt=False, conflict_gradient='core', conflict_search=None):
         super(MNISTAdder, self).__init__()
         self.extractor = MNISTExtractor(4)
         self.fc1 = nn.Linear(8, 128)
@@ -113,6 +118,8 @@ class MNISTAdder(nn.Module):
             variables=inputs+outputs,
             theory=clauses,
             default_mask=mask,
+            conflict_gradient=conflict_gradient,
+            conflict_search=conflict_search,
             solverop='smt' if not use_maxsmt else 'maxsmt')
     
     def forward(self, x, return_sat=True, return_feats=False, do_maxsat=False):
@@ -303,6 +310,16 @@ def train(model, optimizer, train_load, test_load, epochs,
 
         test_acc, test_loss = test_epoch(epoch, model, test_load, use_satlayer=use_satlayer)
 
+        if model.sat.conflict_search is not None:
+            print('conflict_search ' + json.dumps(dict(
+                epoch=epoch, **model.sat.conflict_search.summary())))
+
+        print('training_metrics ' + json.dumps(dict(
+            epoch=epoch, conflict_gradient=model.sat.conflict_gradient,
+            train_acc=float(train_acc), test_acc=float(test_acc),
+            train_loss=float(train_loss), test_loss=float(test_loss),
+            train_seconds=elapsed)))
+
         if train_acc > 0.999:
             break
 
@@ -318,6 +335,14 @@ def train(model, optimizer, train_load, test_load, epochs,
 @click.option('--clip_norm', default=0.1, show_default=True, help='Gradient clipping norm.')
 @click.option('--maxsat_forward', is_flag=True, show_default=True, help='Maxsat forward pass.')
 @click.option('--maxsat_backward', is_flag=True, show_default=True, help='Maxsat backward pass.')
+@click.option('--conflict-gradient', type=click.Choice(['core', 'all_singletons', 'targeted']), default='core', show_default=True)
+@click.option('--conflict-max-size', default=2, show_default=True, help='Largest conflict size searched by targeted gradients.')
+@click.option('--conflict-budget', default=32, show_default=True, help='Solver calls per UNSAT query spent on conflicts larger than singletons.')
+@click.option('--conflict-warmup', default=100, show_default=True, help='UNSAT queries that only profile cores before targeted search starts.')
+@click.option('--conflict-order', type=click.Choice(['prior', 'random']), default='prior', show_default=True, help='Candidate order: learned template prior, or the random baseline.')
+@click.option('--conflict-top-k', type=int, default=None, help='Only search the K most frequent conflict templates.')
+@click.option('--conflict-refinements', default=0, show_default=True, help='Extra checks that extend the revision to a correction set.')
+@click.option('--conflict-print-every', default=0, show_default=True, help='Print the conflicts tried on every N-th searched query; 0 prints nothing.')
 def main(
     lr=1.,
     pretrain_epochs=0,
@@ -327,7 +352,15 @@ def main(
     trials=1,
     clip_norm=0.1,
     maxsat_forward=False,
-    maxsat_backward=False
+    maxsat_backward=False,
+    conflict_gradient='core',
+    conflict_max_size=2,
+    conflict_budget=32,
+    conflict_warmup=100,
+    conflict_order='prior',
+    conflict_top_k=None,
+    conflict_refinements=0,
+    conflict_print_every=0
 ):
 
     test_label_pairs = list(itertools.product(list(range(0,10)), repeat=2))
@@ -349,7 +382,12 @@ def main(
     times = []
 
     for i in range(trials):
-        model = MNISTAdder(use_maxsmt=maxsat_backward).cuda()
+        conflict_search = ConflictSearch(
+            template_fn=addition_template, max_size=conflict_max_size, budget=conflict_budget,
+            warmup=conflict_warmup, order=conflict_order, top_k=conflict_top_k,
+            refinements=conflict_refinements, print_every=conflict_print_every) if conflict_gradient == 'targeted' else None
+        model = MNISTAdder(use_maxsmt=maxsat_backward, conflict_gradient=conflict_gradient,
+                           conflict_search=conflict_search).cuda()
         optimizer = optim.SGD([{'params': model.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
         sched = torch.optim.lr_scheduler.OneCycleLR(optimizer, 
                                                     lr, 

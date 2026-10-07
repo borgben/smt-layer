@@ -17,7 +17,18 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset
 
-from smtlayer import SMTLayer
+from smtlayer import SMTLayer, ConflictSearch
+
+def sudoku_template(indices, size=9):
+    """Conflict size and how the cells of each pair of input bits relate."""
+    def relation(i, j):
+        (r1, c1), (r2, c2) = divmod(i // 4, size), divmod(j // 4, size)
+        if (r1, c1) == (r2, c2):
+            return 'cell'
+        shared = [name for name, same in (('row', r1 == r2), ('col', c1 == c2),
+                                          ('box', (r1 // 3, c1 // 3) == (r2 // 3, c2 // 3))) if same]
+        return '+'.join(shared) or 'unrelated'
+    return len(indices), tuple(sorted(relation(i, j) for i, j in itertools.combinations(indices, 2)))
 
 class MNISTExtractor(nn.Module):
     def __init__(self, n_feats):
@@ -89,7 +100,7 @@ class MNISTSudokuSolver(nn.Module):
     def __init__(self, size=9, measure_alternative_conflicts=False,
                  alternative_conflict_sample_rate=0.1, measure_singleton_conflicts=False,
                  singleton_conflict_sample_rate=0.01, conflict_gradient='core',
-                 measure_singleton_cache_hits=False):
+                 measure_singleton_cache_hits=False, conflict_search=None):
         super(MNISTSudokuSolver, self).__init__()
         
         self.size = size
@@ -140,6 +151,7 @@ class MNISTSudokuSolver(nn.Module):
             singleton_conflict_sample_rate=singleton_conflict_sample_rate,
             conflict_gradient=conflict_gradient,
             measure_singleton_cache_hits=measure_singleton_cache_hits,
+            conflict_search=conflict_search,
             default_mask=None)
 
         self.decode = MNISTDecoder(4)
@@ -465,6 +477,10 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
             print('singleton_cache_hits ' + json.dumps(dict(
                 epoch=epoch, **model.sat.singleton_cache.summary())))
 
+        if model.sat.conflict_search is not None:
+            print('conflict_search ' + json.dumps(dict(
+                epoch=epoch, **model.sat.conflict_search.summary())))
+
         print('training_metrics ' + json.dumps(dict(
             epoch=epoch, conflict_gradient=model.sat.conflict_gradient,
             train_acc=float(train_acc), test_acc=float(test_acc),
@@ -493,7 +509,14 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
 @click.option('--alternative-conflict-sample-rate', default=0.1, type=click.FloatRange(0, 1), show_default=True)
 @click.option('--measure-singleton-conflicts', is_flag=True, help='Count independently conflicting neural bits in sampled UNSAT backward queries.')
 @click.option('--singleton-conflict-sample-rate', default=0.01, type=click.FloatRange(0, 1), show_default=True)
-@click.option('--conflict-gradient', type=click.Choice(['core', 'all_singletons']), default='core', show_default=True)
+@click.option('--conflict-gradient', type=click.Choice(['core', 'all_singletons', 'targeted']), default='core', show_default=True)
+@click.option('--conflict-max-size', default=2, show_default=True, help='Largest conflict size searched by targeted gradients.')
+@click.option('--conflict-budget', default=32, show_default=True, help='Solver calls per UNSAT query spent on conflicts larger than singletons.')
+@click.option('--conflict-warmup', default=100, show_default=True, help='UNSAT queries that only profile cores before targeted search starts.')
+@click.option('--conflict-order', type=click.Choice(['prior', 'random']), default='prior', show_default=True, help='Candidate order: learned template prior, or the random baseline.')
+@click.option('--conflict-top-k', type=int, default=None, help='Only search the K most frequent conflict templates.')
+@click.option('--conflict-refinements', default=0, show_default=True, help='Extra checks that extend the revision to a correction set.')
+@click.option('--conflict-print-every', default=0, show_default=True, help='Print the conflicts tried on every N-th searched query; 0 prints nothing.')
 @click.option('--measure-singleton-cache-hits', is_flag=True, help='Measure per-instance singleton recurrence across training iterations; report cumulative JSON each epoch.')
 @click.option('--seed', type=click.IntRange(0, 2**32 - 1), default=None, help='Seed Python, NumPy and PyTorch for matched runs.')
 @click.option('--early-stop/--no-early-stop', default=True, show_default=True)
@@ -513,6 +536,13 @@ def main(
     singleton_conflict_sample_rate=0.01,
     conflict_gradient='core',
     measure_singleton_cache_hits=False,
+    conflict_max_size=2,
+    conflict_budget=32,
+    conflict_warmup=100,
+    conflict_order='prior',
+    conflict_top_k=None,
+    conflict_refinements=0,
+    conflict_print_every=0,
     seed=None,
     early_stop=True
 ):
@@ -537,8 +567,13 @@ def main(
             torch.manual_seed(trial_seed)
             torch.cuda.manual_seed_all(trial_seed)
         print(f'Trial {i + 1}: conflict_gradient={conflict_gradient}, seed={None if seed is None else trial_seed}')
+        conflict_search = ConflictSearch(
+            template_fn=sudoku_template, max_size=conflict_max_size, budget=conflict_budget,
+            warmup=conflict_warmup, order=conflict_order, top_k=conflict_top_k,
+            refinements=conflict_refinements, print_every=conflict_print_every) if conflict_gradient == 'targeted' else None
         model = MNISTSudokuSolver(
-            size=9, measure_alternative_conflicts=measure_alternative_conflicts,
+            size=9, conflict_search=conflict_search,
+            measure_alternative_conflicts=measure_alternative_conflicts,
             alternative_conflict_sample_rate=alternative_conflict_sample_rate,
             measure_singleton_conflicts=measure_singleton_conflicts,
             singleton_conflict_sample_rate=singleton_conflict_sample_rate,
