@@ -85,7 +85,7 @@ class MNISTDecoder(nn.Module):
         return x
 
 class MNISTSudokuSolver(nn.Module):
-    def __init__(self, size=9):
+    def __init__(self, size=9, marco_union_backward=False, marco_max_muses=8):
         super(MNISTSudokuSolver, self).__init__()
         
         self.size = size
@@ -130,6 +130,8 @@ class MNISTSudokuSolver(nn.Module):
             theory=clauses,
             variables=variables,
             solverop='smt',
+            marco_union_backward=marco_union_backward,
+            marco_max_muses=marco_max_muses,
             default_mask=None)
 
         self.decode = MNISTDecoder(4)
@@ -336,6 +338,9 @@ def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
     train_acc = acc_total / total_samp
     train_loss = loss_total / (1+len(train_load))
 
+    if model.sat.marco_union_backward:
+        tqdm.write('marco_stats={}'.format(model.sat.marco_stats))
+
     return train_acc, train_loss, tloader.format_dict['elapsed']
 
 def test_epoch(epoch_idx, model, test_load, use_satlayer=True, do_maxsat=False):
@@ -449,6 +454,8 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
 @click.option('--clip_norm', default=0.1, show_default=True, help='Gradient clipping norm.')
 @click.option('--maxsat_forward', is_flag=True, show_default=True, help='Maxsat forward pass.')
 @click.option('--maxsat_backward', is_flag=True, show_default=True, help='Maxsat backward pass.')
+@click.option('--marco_union_backward', is_flag=True, default=False, help='Use MARCO MUS union in core backward.')
+@click.option('--marco_max_muses', default=8, type=click.IntRange(min=1), show_default=True, help='Maximum MUSes per backward example.')
 def main(
     lr=1.,
     pretrain_epochs=20,
@@ -458,15 +465,22 @@ def main(
     trials=1,
     clip_norm=0.1,
     maxsat_forward=False,
-    maxsat_backward=False
+    maxsat_backward=False,
+    marco_union_backward=False,
+    marco_max_muses=8
 ):
+
+    if marco_union_backward and maxsat_backward:
+        raise click.UsageError('MARCO union requires core backward, not maxsat_backward')
 
     pretrain_load, _ = get_dataloader(0.9, batch_size=256)
     train_load, test_load = get_dataloader(pct, batch_size=batch_size)
     grad_scaling = None
 
+    train_accs, test_accs, times = [], [], []
     for i in range(trials):
-        model = MNISTSudokuSolver(size=9).cuda()
+        model = MNISTSudokuSolver(size=9, marco_union_backward=marco_union_backward,
+                                  marco_max_muses=marco_max_muses).cuda()
         if pretrain_epochs > 0:
             # pre_optimizer = optim.SGD([{'params': model.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
             pre_optimizer = optim.Adam([{'params': model.extractor.parameters(), 'lr': 1.e-3},

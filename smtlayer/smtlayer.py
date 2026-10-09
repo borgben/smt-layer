@@ -5,6 +5,9 @@ import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
 
 import warnings
+import time
+
+from .marco_union import enumerate_muses
 import z3
 
 class Z3SolverOp(torch.autograd.Function):
@@ -346,7 +349,12 @@ class Z3SolverOp(torch.autograd.Function):
 					solver.assert_and_track(xcon, input_ids[j])
 
 			# check satisfiability of the current solver state
-			if solver.check() == z3.sat:
+			result = solver.check()
+			if result == z3.unknown:
+				reason = solver.reason_unknown()
+				solver.pop()
+				raise RuntimeError('Backward solver returned unknown: ' + reason)
+			if result == z3.sat:
 				is_sat = True
 			else:
 				core = solver.unsat_core()
@@ -355,7 +363,39 @@ class Z3SolverOp(torch.autograd.Function):
 			solver.pop()
 
 			if not is_sat:
+				# We default to the original core. In case MARCO returns nothing. 
 				indices = [int(str(phi)[3:]) for phi in core if str(phi).startswith('var')]
+				if model.marco_union_backward:
+					stats = model.marco_stats
+					stats['calls'] += 1
+					started = time.perf_counter()
+					union = set()
+					found = 0
+
+					# Fixed inputs retain the existing hard-constraint semantics.
+					background = list(theory) + new_y_cons
+					candidates, logit_indices = [], []
+					for j, constraint in enumerate(li):
+						if model._is_fixed[z3_inputs[j]]:
+							background.append(constraint)
+						else:
+							candidates.append(constraint)
+							logit_indices.append(int(str(input_ids[j])[3:]))
+					try:
+						for mus in enumerate_muses(background, candidates, model.marco_max_muses):
+							union.update(logit_indices[j] for j in mus)
+							found += 1
+					except Exception as error:
+						warnings.warn('MARCO enumeration failed: {}'.format(error), RuntimeWarning)
+					finally:
+						stats['enumeration_seconds'] += time.perf_counter() - started
+						stats['muses_found'] += found
+						stats['union_size'] += len(union)
+					if found:
+						indices = sorted(union)
+					else:
+						stats['fallbacks'] += 1
+						warnings.warn('MARCO found no MUS; using original single core', RuntimeWarning)
 				if grad_scaling is not None:
 					sws = F.softmax(-grad_scaling*torch.abs(x[i,indices]), dim=-1)
 				
@@ -507,11 +547,21 @@ class SMTLayer(torch.nn.Module):
 		variables: list[z3.BoolRef]=None,
 		default_mask: torch.Tensor=None,
 		fixed_inputs: list[z3.BoolRef]=None,
-		solverop: str='smt'
+		solverop: str='smt',
+		marco_union_backward: bool=False,
+		marco_max_muses: int=8
 	):
 		
 		super().__init__()
 		
+		if marco_max_muses < 1:
+			raise ValueError('marco_max_muses must be positive')
+		if marco_union_backward and solverop != 'smt':
+			raise ValueError('MARCO union requires the core (smt) backward pass')
+		self.marco_union_backward = marco_union_backward
+		self.marco_max_muses = marco_max_muses
+		self.marco_stats = dict(calls=0, muses_found=0, union_size=0,
+								enumeration_seconds=0.0, fallbacks=0)
 		self.input_size = input_size
 		self.output_size = output_size
 		self.theory = theory

@@ -80,3 +80,72 @@ If you use this code please cite
     url={https://openreview.net/forum?id=r8snfquzs3}
 }
 ```
+
+## Experimental MARCO union backward
+
+The optional `marco_union_backward=True` argument to `SMTLayer` replaces the
+single minimized core in `Z3SolverOp.backward` with the union of at most
+`marco_max_muses=8` MUSes. Defaults preserve the original core behavior. This
+mode requires `solverop='smt'`.
+
+Install the original [liffiton/MARCO](https://github.com/liffiton/MARCO) source
+alongside this project (Python 3.9+, `make`, and a C++ compiler are required):
+
+```bash
+python -m pip install -e .
+git clone https://github.com/liffiton/MARCO.git ../MARCO
+git -C ../MARCO checkout 27e056bd5199ab995cf57473ea17c6a2762ff564
+make -C ../MARCO/src/pyminisolvers
+make -C ../MARCO/src/pyminisolvers test
+export PYTHONPATH="$(realpath ../MARCO):$PWD${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+MARCO is optional; its source root must be on `PYTHONPATH` when enabled. The
+SMT path needs `z3-solver` (already an SMTLayer dependency) and the built MiniSAT
+bindings; MUSer2 is unnecessary. The commit above is the version tested here.
+
+The adapter in `smtlayer/marco_union.py` calls upstream `MarcoPolo.enumerate`,
+`Z3SubsetSolver` shrinking/growing, and `MinisatMapSolver` directly, in process,
+with no parallel workers. We inspected upstream README, `lib_examples.py`, and
+these implementations. The top-level file API makes each assertion selectable
+and configures processes/signals, so the adapter instead supplies an in-memory
+subset solver. Only neural assignment literals receive selectors; theory,
+corrected-output literals, and existing fixed inputs remain hard. Upstream
+1-based assignment indices are converted to zero-based indices, then mapped
+back through the input mask to original logit positions. Fresh selectors and
+per-call caches avoid symbol collisions and cross-call solver state.
+
+The corrected output remains `sign(sign(y) - 2*sign(grad_output))`. Neural
+assignments use the existing literal conversion (negative logits mean false;
+zero retains the existing nonnegative convention). The only gradient change is
+`indices = sorted(union)` instead of the single core's indices. Each selected
+index still receives the existing `grad_minus`, calculated by
+`BCEWithLogitsLoss(x, 1 - relu(sign(x)))`; its mean reduction, optional
+`grad_scaling`, and forward MaxSAT flip handling are unchanged. With nonzero
+logits and no scaling/flips this is
+`(sigmoid(u_i) - (1 - zbar_i)) / x.numel()` on the union, and zero elsewhere.
+The no-output-correction branch and forward pass are unchanged.
+
+Enumeration stops after the requested number of MUSes (MSS results do not count).
+This caps MUS count, not elapsed time. Solver `unknown` raises an error rather
+than being classified as SAT/UNSAT. Enumeration errors emit a warning; any
+already discovered MUSes are retained. If no MUS was discovered, the original
+single core is used and the fallback counter increments. An `unknown` from the
+original backward solver raises, since no valid fallback core is available.
+
+`layer.marco_stats` contains cumulative `calls`, `muses_found`, `union_size`
+(sum of per-call unique union sizes), `enumeration_seconds`, and `fallbacks`.
+The Sudoku trainer prints this dictionary each epoch through its existing
+`tqdm` logging.
+
+Example training (requires the existing Sudoku data and CUDA setup):
+
+```bash
+python scripts/mnist_sudoku.py --marco_union_backward --marco_max_muses 8 --epochs 5
+```
+
+Run the small CPU tests after installing MARCO as above:
+
+```bash
+python -m unittest discover -s tests -v
+```
