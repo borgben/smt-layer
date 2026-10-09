@@ -218,3 +218,127 @@ enabled alongside the new gradient mode, they reuse that example's probe result
 rather than checking its assumptions twice. Their `solver_calls` reports the
 checks underlying sampled measurements, not additional diagnostic-only checks.
 No caching is introduced.
+
+## Structural conflict profiling and targeted search
+
+This prototype learns low-order Sudoku conflict shapes to order **solver checks**.
+Every reported search conflict is solver-verified UNSAT, with every immediate
+proper subset verified SAT. Frequencies never certify UNSAT. All modes below
+preserve existing Bcore gradient selection; there is no new gradient flag and
+pairs/triples never produce extra bit flips. Bmax backward is rejected when
+structural instrumentation is enabled. Existing defaults and splits are unchanged.
+
+New CLI flags (underscore spelling):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--profile_conflicts` | off | Profile original raw cores |
+| `--profile_minimal_conflicts` | off | Enable profiling and deletion minimization |
+| `--conflict_struct_search` | off | Enable additional conflict analysis and profiling |
+| `--conflict_struct_max_k` | 3 | Search cardinalities 1–3 |
+| `--conflict_struct_budget` | 32 | Additional search solver calls per UNSAT backward query |
+| `--conflict_struct_warmup_epochs` | 1 | Collect only during the first N training epochs |
+| `--conflict_struct_top_templates` | 20 | Number of templates logged per cardinality |
+| `--conflict_struct_order` | frequency | `frequency` or `random` candidate ranking |
+
+```bash
+# Profiling only (omit minimal flag for raw core structure)
+python scripts/mnist_sudoku.py --profile_minimal_conflicts --seed 0
+# Singleton-only analysis
+python scripts/mnist_sudoku.py --conflict_struct_search --conflict_struct_max_k 1 --seed 0
+# Frequency-ranked analysis
+python scripts/mnist_sudoku.py --conflict_struct_search --conflict_struct_order frequency --conflict_struct_budget 32 --seed 0
+# Matched random baseline
+python scripts/mnist_sudoku.py --conflict_struct_search --conflict_struct_order random --conflict_struct_budget 32 --seed 0
+```
+
+Use `--no-early-stop` and matching epochs/seeds for fixed-duration ablations.
+Original Bcore requires no new flags. Both ranking modes share the same call
+budget, including the background check and uncached subset checks. Consequently,
+32 calls can be spent entirely on singletons; increase the budget to reach pairs
+and triples in puzzles with many neural inputs. Cache hits do not spend calls.
+Deletion minimization is outside the search budget and its calls are logged
+separately. Search runs only on UNSAT backward queries with corrected outputs.
+Evaluation has no backward pass and does not update the prior.
+
+The mapping is `cell=i//4`, `bit=i%4`, `row=cell//size`, `col=cell%size`.
+The existing `Concat` and NumPy binary encoding put the most significant bit at
+position 0. Size 9 uses 3×3 boxes; size 6 uses 2×3 boxes; size 3 has no box
+constraints. Fixed inputs and corrected output conditions are hard background;
+only tracked neural input assumptions are candidate literals.
+
+Canonical keys preserve bit/value node labels and all SAME_CELL, SAME_ROW,
+SAME_COL and SAME_BOX edge relations, while dropping absolute positions.
+Permutation enumeration gives exact keys for cardinalities up to three. Larger
+cores contribute cardinality counts only (`template_max_k=3`), avoiding factorial
+canonicalization. Unknown minimization results are counted as inconclusive and
+excluded from the minimized profile. Unknown search results cannot establish
+conflicts or minimality and are not cached.
+
+The prior is cumulative and pools original cores with discovered minimal
+conflicts (source counts distinguish them). It is a frequency of **observed**
+conflicts, subject to solver selection and search bias, not a calibrated
+probability of UNSAT. Search counters reset each epoch; profile counts are
+cumulative. Ranking is frozen within a query, ordered by template counts with
+index ties, or by private seeded random priorities. Top-template limits affect
+logging only; unseen templates remain eligible. Candidate enumeration uses a
+streaming heap retaining at most `budget` candidates per phase. It can still
+cost CPU time for large budgets. Only verified-SAT singleton coordinates enter
+higher phases, and known UNSAT subsets prune supersets. Missing pair checks are
+performed before testing a triple. Ranks are within each phase's eligible list;
+recall is omitted because the complete conflict set is unknown.
+
+A fresh solver copies the permanent assertions for instrumentation, protecting
+both the assertions and search heuristics of the training solver. A fresh cache
+is local to each backward query; its keys include permanent assertions, corrected
+outputs, fixed inputs, the full mask, and assumption labels/values. No result is
+reused across queries, puzzles, or changed contexts. The prototype does not yet
+persist priors or provide held-out structural evaluation.
+
+`training_metrics` retains existing accuracy/loss/time fields and adds nested
+`conflict_profile` and `struct_search` objects. Example excerpt (illustrative):
+
+```json
+{
+  "epoch": 2,
+  "train_acc": 0.5,
+  "test_acc": 0.4,
+  "train_loss": 0.2,
+  "test_loss": 0.3,
+  "train_seconds": 100.0,
+  "conflict_profile": {
+    "total_conflicts": 10,
+    "unique_templates": 1,
+    "size_counts": {"1": 10},
+    "core_structure": "raw core structure",
+    "top_templates": {"1": [{"template": ["k1", [[2, 1]], []], "count": 10}]},
+    "top1_coverage_by_k": {"1": 1.0},
+    "top5_coverage_by_k": {"1": 1.0},
+    "top10_coverage_by_k": {"1": 1.0}
+  },
+  "struct_search": {
+    "queries_requested": 40,
+    "solver_calls": 32,
+    "cache_hits": 8,
+    "cache_misses": 32,
+    "cache_hit_rate": 0.2,
+    "candidates_generated_k1": 12,
+    "candidates_generated_k2": 45,
+    "candidates_generated_k3": 0,
+    "candidates_tested_k1": 12,
+    "candidates_tested_k2": 19,
+    "candidates_tested_k3": 0,
+    "conflicts_found_k1": 2,
+    "conflicts_found_k2": 1,
+    "conflicts_found_k3": 0,
+    "budget_exhausted_count": 1,
+    "mean_rank_of_found_conflict": 4.0,
+    "recall_omitted": "full conflict set is unknown"
+  }
+}
+```
+
+Verification: `.venv/bin/python -m unittest discover -s tests -q`.
+Structural tests cover decoding, graph equivalence/non-equivalence, permutations,
+minimality, pruning, context isolation, equal budgets, warmup, solver isolation,
+frequency ordering, independent UNSAT checks, and unchanged gradients.

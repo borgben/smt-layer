@@ -89,7 +89,8 @@ class MNISTSudokuSolver(nn.Module):
     def __init__(self, size=9, measure_alternative_conflicts=False,
                  alternative_conflict_sample_rate=0.1, measure_singleton_conflicts=False,
                  singleton_conflict_sample_rate=0.01, conflict_gradient='core',
-                 measure_singleton_cache_hits=False):
+                 measure_singleton_cache_hits=False, maxsat_backward=False,
+                 conflict_struct_options=None):
         super(MNISTSudokuSolver, self).__init__()
         
         self.size = size
@@ -133,13 +134,14 @@ class MNISTSudokuSolver(nn.Module):
             output_size=4*size*size,
             theory=clauses,
             variables=variables,
-            solverop='smt',
+            solverop='maxsat' if maxsat_backward else 'smt',
             measure_alternative_conflicts=measure_alternative_conflicts,
             alternative_conflict_sample_rate=alternative_conflict_sample_rate,
             measure_singleton_conflicts=measure_singleton_conflicts,
             singleton_conflict_sample_rate=singleton_conflict_sample_rate,
             conflict_gradient=conflict_gradient,
             measure_singleton_cache_hits=measure_singleton_cache_hits,
+            conflict_struct_options=conflict_struct_options,
             default_mask=None)
 
         self.decode = MNISTDecoder(4)
@@ -440,6 +442,9 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
     
     for epoch in range(1, epochs+1):
 
+        if model.sat.structural_conflicts is not None:
+            model.sat.structural_conflicts.begin_epoch(epoch)
+
         if do_sched_batch:
             train_acc, train_loss, elapsed = train_epoch(epoch, model, optimizer, train_load, 
                                                 use_satlayer=use_satlayer, clip_norm=clip_norm, sched=sched,
@@ -465,11 +470,19 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
             print('singleton_cache_hits ' + json.dumps(dict(
                 epoch=epoch, **model.sat.singleton_cache.summary())))
 
+        structural_metrics = {}
+        if model.sat.structural_conflicts is not None:
+            structural = model.sat.structural_conflicts
+            structural_metrics = dict(
+                conflict_profile=structural.profiler.summary(structural.top_templates),
+                struct_search=structural.summary())
+
         print('training_metrics ' + json.dumps(dict(
             epoch=epoch, conflict_gradient=model.sat.conflict_gradient,
             train_acc=float(train_acc), test_acc=float(test_acc),
             train_loss=float(train_loss), test_loss=float(test_loss),
-            train_seconds=elapsed, singleton_gradient=model.sat.singleton_gradient_stats)))
+            train_seconds=elapsed, singleton_gradient=model.sat.singleton_gradient_stats,
+            **structural_metrics)))
 
         prev_acc = train_acc
         times.append(elapsed)
@@ -495,6 +508,14 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
 @click.option('--singleton-conflict-sample-rate', default=0.01, type=click.FloatRange(0, 1), show_default=True)
 @click.option('--conflict-gradient', type=click.Choice(['core', 'all_singletons']), default='core', show_default=True)
 @click.option('--measure-singleton-cache-hits', is_flag=True, help='Measure per-instance singleton recurrence across training iterations; report cumulative JSON each epoch.')
+@click.option('--profile_conflicts', is_flag=True, help='Profile raw Sudoku backward cores without changing gradients.')
+@click.option('--profile_minimal_conflicts', is_flag=True, help='Enable profiling with deletion-minimized cores.')
+@click.option('--conflict_struct_search', is_flag=True, help='Search additional verified minimal conflicts; analysis only.')
+@click.option('--conflict_struct_max_k', default=3, type=click.IntRange(1, 3), show_default=True)
+@click.option('--conflict_struct_budget', default=32, type=click.IntRange(0), show_default=True)
+@click.option('--conflict_struct_warmup_epochs', default=1, type=click.IntRange(0), show_default=True)
+@click.option('--conflict_struct_top_templates', default=20, type=click.IntRange(1), show_default=True)
+@click.option('--conflict_struct_order', default='frequency', type=click.Choice(['frequency', 'random']), show_default=True)
 @click.option('--seed', type=click.IntRange(0, 2**32 - 1), default=None, help='Seed Python, NumPy and PyTorch for matched runs.')
 @click.option('--early-stop/--no-early-stop', default=True, show_default=True)
 def main(
@@ -514,9 +535,20 @@ def main(
     conflict_gradient='core',
     measure_singleton_cache_hits=False,
     seed=None,
-    early_stop=True
+    early_stop=True,
+    profile_conflicts=False,
+    profile_minimal_conflicts=False,
+    conflict_struct_search=False,
+    conflict_struct_max_k=3,
+    conflict_struct_budget=32,
+    conflict_struct_warmup_epochs=1,
+    conflict_struct_top_templates=20,
+    conflict_struct_order="frequency"
 ):
 
+    structural_enabled = profile_conflicts or profile_minimal_conflicts or conflict_struct_search
+    if structural_enabled and maxsat_backward:
+        raise click.UsageError('Structural profiling/search requires Bcore (--maxsat_backward disabled).')
     pretrain_load, _ = get_dataloader(0.9, batch_size=256)
     train_load, test_load = get_dataloader(pct, batch_size=batch_size,
                                            include_instance_ids=measure_singleton_cache_hits)
@@ -543,7 +575,14 @@ def main(
             measure_singleton_conflicts=measure_singleton_conflicts,
             singleton_conflict_sample_rate=singleton_conflict_sample_rate,
             conflict_gradient=conflict_gradient,
-            measure_singleton_cache_hits=measure_singleton_cache_hits).to(device)
+            measure_singleton_cache_hits=measure_singleton_cache_hits,
+            maxsat_backward=maxsat_backward,
+            conflict_struct_options=(dict(
+                size=9, minimal=profile_minimal_conflicts, search=conflict_struct_search,
+                max_k=conflict_struct_max_k, budget=conflict_struct_budget,
+                warmup_epochs=conflict_struct_warmup_epochs,
+                top_templates=conflict_struct_top_templates, order=conflict_struct_order,
+                seed=0 if seed is None else trial_seed) if structural_enabled else None)).to(device)
         if pretrain_epochs > 0:
             # pre_optimizer = optim.SGD([{'params': model.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
             pre_optimizer = optim.Adam([{'params': model.extractor.parameters(), 'lr': 1.e-3},

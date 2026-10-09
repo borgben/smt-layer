@@ -8,6 +8,8 @@ import warnings
 import z3
 from .diagnostics import AlternativeConflictDiagnostic, SingletonConflictDiagnostic, SingletonCacheDiagnostic, probe_singletons
 
+from .conflict_structure import StructuralConflicts
+
 class Z3SolverOp(torch.autograd.Function):
 	"""
 		A torch.autograd.Function that takes a batch of floating-point
@@ -360,6 +362,7 @@ class Z3SolverOp(torch.autograd.Function):
 			gradient_core = core if not is_sat else None
 			if result == z3.unsat and (model.alternative_conflicts is not None
 					or model.singleton_conflicts is not None
+					or model.structural_conflicts is not None
 					or model.conflict_gradient == "all_singletons"
 					or (model.singleton_cache is not None and ctx.instance_ids is not None)):
 				hard = list(new_y_cons)
@@ -369,6 +372,9 @@ class Z3SolverOp(torch.autograd.Function):
 						hard.append(xcon)
 					else:
 						tracked.append((input_ids[j], xcon))
+				if model.structural_conflicts is not None:
+					model.structural_conflicts.observe(solver, hard, tracked, core,
+						mask[i].detach().cpu().tolist())
 				probe = None
 				if model.conflict_gradient == 'all_singletons':
 					probe = probe_singletons(solver, hard, tracked)
@@ -548,7 +554,8 @@ class SMTLayer(torch.nn.Module):
 		measure_singleton_conflicts: bool=False,
 		singleton_conflict_sample_rate: float=0.01,
 		conflict_gradient: str='core',
-		measure_singleton_cache_hits: bool=False
+		measure_singleton_cache_hits: bool=False,
+		conflict_struct_options: dict=None
 	):
 		
 		super().__init__()
@@ -557,6 +564,10 @@ class SMTLayer(torch.nn.Module):
 			raise ValueError('conflict_gradient must be core or all_singletons')
 		if conflict_gradient != 'core' and solverop != 'smt':
 			raise ValueError('singleton gradients require solverop=smt')
+		if conflict_struct_options is not None and solverop != "smt":
+			raise ValueError("structural conflicts require solverop=smt")
+		self.structural_conflicts = (StructuralConflicts(**conflict_struct_options)
+			if conflict_struct_options is not None else None)
 		self.conflict_gradient = conflict_gradient
 		self.diagnostic_instance_ids = None
 		self.singleton_cache = SingletonCacheDiagnostic() if measure_singleton_cache_hits else None
