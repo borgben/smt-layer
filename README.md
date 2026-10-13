@@ -149,3 +149,61 @@ Run the small CPU tests after installing MARCO as above:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+### Seeded Sudoku splits
+
+Add `--seed 0` to reproduce a randomized Sudoku train/test split and initialize
+Python, NumPy, and PyTorch training randomness. Different seeds produce different
+splits. Images, labels, and masks are shuffled together after preprocessing;
+the cached dataset remains unchanged. Pretraining uses the same permutation as
+training, keeping pretraining examples out of the test set. Existing split sizes
+and the reserved test region starting at `max(9000, nTrain)` are preserved.
+Omitting `--seed` retains the original ordered split. Repeated trials use the
+same split and advance the seeded training random sequence. GPU operations may
+still introduce nondeterminism.
+
+```bash
+python -u -m scripts.mnist_sudoku \
+  --pct 0.5 --pretrain_epochs 30 --epochs 5 \
+  --batch_size 1 --lr 1.0 --clip_norm 0.1 \
+  --seed 0 --marco_union_backward --marco_max_muses 8 \
+  2>&1 | tee marco-union-seed0.log
+```
+
+### Diminishing returns sweep (core baseline, then K = 1 through 8)
+
+After setting up MARCO and `PYTHONPATH` above, run:
+
+```bash
+python -u -m scripts.marco_sweep \
+  --pct 0.5 --pretrain_epochs 30 --epochs 5 \
+  --batch_size 1 --lr 1.0 --clip_norm 0.1 --seed 0 \
+  --output marco-sweep.csv \
+  2>&1 | tee marco-sweep.log
+```
+
+This CUDA experiment pretrains once, saves `marco-sweep.pretrained.pt` (a full
+model state dictionary), and reloads that same state for the original single-core baseline first, then
+for every K. To reuse an
+existing full-model checkpoint, pass `--pretrained_checkpoint PATH`; pretraining
+is then skipped. Use a checkpoint prepared with the same dataset split/seed.
+Each K resets Python, NumPy, PyTorch/CUDA, and Z3 seeds, uses fresh optimizer and
+scheduler state, and runs the same fixed epoch budget without early stopping.
+Dataset loaders are reused, preserving the split across K. GPU operations may
+still be nondeterministic. K controls the existing union of the first K MUSes;
+the surrogate gradient is unchanged.
+
+The CSV is flushed after each K and has nine rows on successful completion. The first row has `mode=core` and
+an empty K; the following rows have `mode=marco_union` and K=1 through 8.
+The core baseline disables MARCO and has zero MARCO statistics.
+Accuracy/loss are from the final epoch: training metrics aggregate the updates
+in that epoch, and test metrics evaluate the final epoch model. Losses are
+sample-weighted means of the existing masked BCE loss (including its existing
+mask normalization). `training_seconds` sums synchronized training-epoch wall
+time, including enumeration and optimizer work; it excludes shared pretraining
+and test evaluation. `marco_enumeration_seconds` and `muses_found` cover all
+training epochs. `mean_mus_size` is total discovered MUS membership divided by
+MUS count. `mean_union_size` is summed unique union sizes divided by enumeration
+calls, including zero-size fallback calls. No-call/no-MUS means are recorded as
+zero. `marco_calls` and `fallbacks` are included to identify incomplete runs.
+Hyperparameters, seed, and checkpoint path are recorded in every row.

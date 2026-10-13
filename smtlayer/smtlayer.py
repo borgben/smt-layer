@@ -384,6 +384,7 @@ class Z3SolverOp(torch.autograd.Function):
 					try:
 						for mus in enumerate_muses(background, candidates, model.marco_max_muses):
 							union.update(logit_indices[j] for j in mus)
+							stats['mus_size'] += len(mus)
 							found += 1
 					except Exception as error:
 						warnings.warn('MARCO enumeration failed: {}'.format(error), RuntimeWarning)
@@ -560,7 +561,7 @@ class SMTLayer(torch.nn.Module):
 			raise ValueError('MARCO union requires the core (smt) backward pass')
 		self.marco_union_backward = marco_union_backward
 		self.marco_max_muses = marco_max_muses
-		self.marco_stats = dict(calls=0, muses_found=0, union_size=0,
+		self.marco_stats = dict(calls=0, muses_found=0, mus_size=0, union_size=0,
 								enumeration_seconds=0.0, fallbacks=0)
 		self.input_size = input_size
 		self.output_size = output_size

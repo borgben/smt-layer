@@ -262,7 +262,7 @@ def load(file):
     with open(f'data/{file}', 'rb') as f:
         return torch.load(f)
 
-def get_dataloader(train_pct, batch_size=1):
+def get_dataloader(train_pct, batch_size=1, seed=None):
 
     X_in = load('sudoku_features.pt')
     Ximg_in = load('sudoku_features_img.pt')
@@ -270,6 +270,13 @@ def get_dataloader(train_pct, batch_size=1):
     perm = load('sudoku_perm.pt')
 
     Ximg, Y, is_input = process_inputs(X_in, Ximg_in, Y_in, 9)
+
+    if seed is not None:
+        # A local generator gives pretraining and training the same permutation,
+        # independent of any intervening model initialization or loader shuffles.
+        generator = torch.Generator().manual_seed(seed)
+        indices = torch.randperm(Ximg.size(0), generator=generator)
+        Ximg, Y, is_input = Ximg[indices], Y[indices], is_input[indices]
 
     nTrain = int(Ximg.size(0)*train_pct)
 
@@ -325,18 +332,18 @@ def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
             acc = torch.sum(errs.float())
             
             acc_total += acc.item()
-            loss_total += loss.item()
+            loss_total += loss.item() * float(len(data[0]))
             total_samp += float(len(data[0]))
             batch_total += 1.
             
             tloader.set_description('train {} loss={:.4} acc={:.4} lr={:.4}'.format(epoch_idx, 
-                loss_total/(batch_total), acc_total/total_samp, optimizer.param_groups[0]['lr']))
+                loss_total/total_samp, acc_total/total_samp, optimizer.param_groups[0]['lr']))
         
         if sched is not None:
             sched.step()
 
     train_acc = acc_total / total_samp
-    train_loss = loss_total / (1+len(train_load))
+    train_loss = loss_total / total_samp
 
     if model.sat.marco_union_backward:
         tqdm.write('marco_stats={}'.format(model.sat.marco_stats))
@@ -368,14 +375,14 @@ def test_epoch(epoch_idx, model, test_load, use_satlayer=True, do_maxsat=False):
             loss = (F.binary_cross_entropy_with_logits(output, target, reduction='none') * torch.relu(-mask_inter)).mean()
             
             acc_total += acc
-            loss_total += loss.item()
+            loss_total += loss.item() * float(len(data[0]))
             total_samp += float(len(data[0]))
             
             tloader.set_description('test {} loss={:.4} acc={:.4}'.format(epoch_idx, 
-                loss_total/(batch_idx+1), acc_total/total_samp))
+                loss_total/total_samp, acc_total/total_samp))
     
     test_acc = acc_total.cpu().detach().numpy()/total_samp
-    test_loss = loss_total / (1+len(test_load))
+    test_loss = loss_total / total_samp
 
     return test_acc, test_loss
 
@@ -450,6 +457,7 @@ def train(model, optimizer, train_load, test_load, epochs, pct,
 @click.option('--pct', default=0.5, show_default=True, help='% pairs to use in training data.')
 @click.option('--epochs', default=5, show_default=True, help='Number of epochs.')
 @click.option('--batch_size', default=16, show_default=True, help='Batch size.')
+@click.option('--seed', default=None, type=click.IntRange(min=0, max=2**32-1), help='Seed dataset split and training randomness.')
 @click.option('--trials', default=1, show_default=True, help='Number of trials.')
 @click.option('--clip_norm', default=0.1, show_default=True, help='Gradient clipping norm.')
 @click.option('--maxsat_forward', is_flag=True, show_default=True, help='Maxsat forward pass.')
@@ -467,14 +475,22 @@ def main(
     maxsat_forward=False,
     maxsat_backward=False,
     marco_union_backward=False,
-    marco_max_muses=8
+    marco_max_muses=8,
+    seed=None
 ):
 
     if marco_union_backward and maxsat_backward:
         raise click.UsageError('MARCO union requires core backward, not maxsat_backward')
 
-    pretrain_load, _ = get_dataloader(0.9, batch_size=256)
-    train_load, test_load = get_dataloader(pct, batch_size=batch_size)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        click.echo('seed={}'.format(seed))
+
+    pretrain_load, _ = get_dataloader(0.9, batch_size=256, seed=seed)
+    train_load, test_load = get_dataloader(pct, batch_size=batch_size, seed=seed)
     grad_scaling = None
 
     train_accs, test_accs, times = [], [], []
